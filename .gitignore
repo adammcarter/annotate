@@ -1,0 +1,54 @@
+# Build output
+.build/
+build/
+DerivedData/
+*.dSYM.zip
+*.hmap
+*.ipa
+
+# Xcode local state
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+.swiftpm/
+
+# Signing — never commit these
+*.pem
+*.p12
+*.key
+*.cer
+*.mobileprovision
+*.xcconfig.local
+.env
+.env.*
+.netrc
+
+# Machine-local run state
+*.log
+*.pid
+scratch/
+showcase-runs/
+
+# The acceptance LEDGER is committed: it is what lets the repository prove the
+# behaviours use-cases/annotate.yml claims, and what lets CI notice when a proof
+# no longer covers the code it was taken against. It holds hashes and row ids —
+# no paths, no machine, no captured output — so it is safe in a public tree.
+# Checked by the "Acceptance ledger" step in .github/workflows/ci.yml.
+#
+# Showcase runs stay out: those DO capture output, and output is where the
+# machine leaks in.
+
+# macOS
+.DS_Store
+
+# Byte-compiled Tools/ scripts (mcp-real-e2e imports bridge-cmd by path)
+__pycache__/
+
+# Editor / assistant workspace state
+.claude/
+.vscode/
+.idea/
+
+# Local README preview (regenerated on demand)
+.readme-preview.html
+*.profraw

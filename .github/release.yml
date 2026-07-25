@@ -1,0 +1,17 @@
+# Groups the auto-generated "What's Changed" list in release notes.
+#
+# Ordering is deliberate: a reader wants to know what they can now do, then
+# what stopped being broken, before anything else.
+changelog:
+  exclude:
+    labels:
+      - no-release-note
+  categories:
+    - title: New
+      labels: [feature, enhancement]
+    - title: Fixed
+      labels: [bug, fix]
+    - title: Documentation
+      labels: [documentation, docs]
+    - title: Everything else
+      labels: ["*"]

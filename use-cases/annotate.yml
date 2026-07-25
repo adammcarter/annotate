@@ -1,0 +1,846 @@
+schema_version: 1
+feature:
+  id: annotate
+  name: Annotate — agent-driven screen annotations
+  summary: AI agents draw ephemeral hand-drawn annotations (circle, highlight, underline, arrow, text) on a transparent click-through macOS overlay, via MCP -> unix socket.
+metadata:
+  owner: maintainers
+  lifecycle: active
+use_cases:
+  - id: annotate.protocol.draw
+    title: Socket draw command renders an annotation and returns its id
+    lifecycle: active
+    value_tier: core
+    journey_role: golden
+    usage_frequency: common
+    tags:
+      - protocol
+      - socket
+    source_refs:
+      - kind: file
+        path: Annotate/Control/ControlPlane.swift
+    actor: agent
+    intent: Draw a circle on screen by sending one ND-JSON line to the control socket.
+    preconditions:
+      - Annotate.app built; socket path available.
+    trigger: A circle command arrives on the unix socket.
+    scenarios:
+      - id: annotate.protocol.draw.main
+        kind: steps
+        steps:
+          - Connect to the socket (app auto-launched if needed).
+          - Send ping, then a circle command with a target rect.
+          - Read the replies.
+    observable_outcomes:
+      - ping returns version 1.
+      - circle returns ok:true and an annotationId; the shape animates on screen.
+    host_applicability:
+      - host_surface: unknown
+        supported: true
+    verification_policy:
+      mode: requirements
+      requirements:
+        - evidence_kind: test_result
+          required_verifiers:
+            - acceptance
+          minimum_count: 1
+    approval_policy:
+      mode: none
+  - id: annotate.protocol.validation
+    title: Invalid input is rejected with the contract's error codes
+    lifecycle: active
+    value_tier: core
+    journey_role: edge
+    usage_frequency: common
+    tags:
+      - protocol
+      - validation
+    source_refs:
+      - kind: file
+        path: Packages/AnnotateCore/Sources/AnnotateCore/Protocol.swift
+    actor: agent
+    intent: Receive precise machine-readable errors for malformed or invalid commands.
+    preconditions:
+      - Annotate.app running.
+    trigger: Unknown command, oversize text, or non-positive geometry is sent.
+    scenarios:
+      - id: annotate.protocol.validation.main
+        kind: steps
+        steps:
+          - Send an unknown command; send >300-char text; send a negative-size rect.
+    observable_outcomes:
+      - unknown_cmd and invalid_params error codes come back; nothing draws.
+    host_applicability:
+      - host_surface: unknown
+        supported: true
+    verification_policy:
+      mode: requirements
+      requirements:
+        - evidence_kind: test_result
+          required_verifiers:
+            - acceptance
+          minimum_count: 1
+    approval_policy:
+      mode: none
+  - id: annotate.core.determinism
+    title: Sketch geometry is seeded and deterministic
+    lifecycle: active
+    value_tier: core
+    journey_role: alternate
+    usage_frequency: common
+    tags:
+      - rendering
+      - determinism
+    source_refs:
+      - kind: file
+        path: Packages/AnnotateCore/Sources/AnnotateCore/Rough.swift
+      - kind: file
+        path: Packages/AnnotateCore/Sources/AnnotateCore/Sketch.swift
+    actor: developer
+    intent: Identical annotation ids always produce identical hand-drawn geometry.
+    preconditions:
+      - AnnotateCore package present.
+    trigger: The deterministic/golden unit tests run.
+    scenarios:
+      - id: annotate.core.determinism.main
+        kind: steps
+        steps:
+          - Run the AnnotateCore determinism/golden test filter.
+    observable_outcomes:
+      - All filtered tests pass (SplitMix64 sequence, golden endpoints, seed sensitivity).
+    host_applicability:
+      - host_surface: unknown
+        supported: true
+    verification_policy:
+      mode: requirements
+      requirements:
+        - evidence_kind: test_result
+          required_verifiers:
+            - acceptance
+          minimum_count: 1
+    approval_policy:
+      mode: none
+  - id: annotate.mcp.bridge
+    title: MCP stdio tools drive the live app end to end
+    lifecycle: active
+    value_tier: core
+    journey_role: golden
+    usage_frequency: common
+    tags:
+      - mcp
+      - e2e
+    source_refs:
+      - kind: file
+        path: Packages/AnnotateMCP/Sources/AnnotateMCPKit/Server.swift
+    actor: agent
+    intent: Draw on screen through the real MCP server binary, not the socket directly.
+    preconditions:
+      - annotate-mcp release binary built; Annotate.app running or launchable.
+    trigger: An MCP client initializes and calls annotate_circle.
+    scenarios:
+      - id: annotate.mcp.bridge.main
+        kind: steps
+        steps:
+          - Speak JSON-RPC over the binary's stdio (initialize, tools/list, tools/call).
+    observable_outcomes:
+      - Six tools listed; annotate_circle returns ok + annotationId; clear succeeds.
+    host_applicability:
+      - host_surface: unknown
+        supported: true
+    verification_policy:
+      mode: requirements
+      requirements:
+        - evidence_kind: test_result
+          required_verifiers:
+            - acceptance
+          minimum_count: 1
+    approval_policy:
+      mode: none
+  - id: annotate.overlay.idle
+    title: Idle overlay costs ~zero CPU and small memory
+    lifecycle: active
+    value_tier: core
+    journey_role: alternate
+    usage_frequency: common
+    tags:
+      - performance
+    source_refs:
+      - kind: file
+        path: Annotate/Ink/FreshInkPathProvider.swift
+    actor: user
+    intent: The app never taxes the machine while annotations sit on screen.
+    preconditions:
+      - Annotate.app running with a settled annotation.
+    trigger: Animations settle after a draw.
+    scenarios:
+      - id: annotate.overlay.idle.main
+        kind: steps
+        steps:
+          - Draw a sticky circle; wait for settle; sample ps %cpu and rss.
+    observable_outcomes:
+      - "%cpu <= 1.0 and RSS < 60 MB with an annotation live."
+    host_applicability:
+      - host_surface: unknown
+        supported: true
+    verification_policy:
+      mode: requirements
+      requirements:
+        - evidence_kind: test_result
+          required_verifiers:
+            - acceptance
+          minimum_count: 1
+    approval_policy:
+      mode: none
+  - id: annotate.overlay.clickthrough
+    title: Clicks pass through the overlay to the app beneath
+    lifecycle: active
+    value_tier: core
+    journey_role: golden
+    usage_frequency: common
+    tags:
+      - overlay
+      - input
+    source_refs:
+      - kind: file
+        path: Annotate/Overlay/OverlayWindow.swift
+    actor: user
+    intent: Keep working normally while annotations are on screen.
+    preconditions:
+      - Annotate.app running; an annotation covers part of another app's window.
+    trigger: The user clicks inside the annotated region.
+    scenarios:
+      - id: annotate.overlay.clickthrough.main
+        kind: steps
+        steps:
+          - Draw a sticky circle; synthesize a click inside it; compare frontmost app.
+    observable_outcomes:
+      - The overlay app never becomes frontmost; the click lands beneath.
+    host_applicability:
+      - host_surface: unknown
+        supported: true
+    verification_policy:
+      mode: requirements
+      requirements:
+        - evidence_kind: test_result
+          required_verifiers:
+            - acceptance
+          minimum_count: 1
+    approval_policy:
+      mode: none
+  - id: annotate.teaching.tour
+    title: Guided tour — an agent teaches the screen (north-star scenario)
+    lifecycle: active
+    value_tier: core
+    journey_role: golden
+    usage_frequency: common
+    tags:
+      - teaching
+      - demo
+      - north-star
+    source_refs:
+      - kind: file
+        path: Tools/guided-tour.sh
+    actor: agent
+    intent: Teach a human their screen with sequenced circle/arrow/highlight/underline/text cues.
+    preconditions:
+      - Annotate.app running.
+    trigger: The guided tour runs (lesson -> clear -> next lesson).
+    scenarios:
+      - id: annotate.teaching.tour.main
+        kind: steps
+        steps:
+          - Run Tools/guided-tour.sh; each lesson draws, pauses, clears, advances.
+          - Lesson 1 pairs a circle on the Apple menu with an underline under the menu titles beside it — the phrase cue, drawn without covering the text.
+    observable_outcomes:
+      - Every step returns ok:true; four lessons complete; screen ends clean.
+      - Lesson 1 shows both cues at once — the loop around the Apple menu and the underline sitting below the menu titles, which stay readable.
+    host_applicability:
+      - host_surface: unknown
+        supported: true
+    verification_policy:
+      mode: requirements
+      requirements:
+        - evidence_kind: test_result
+          required_verifiers:
+            - acceptance
+          minimum_count: 1
+    approval_policy:
+      mode: none
+  - id: annotate.tool.circle
+    title: "MCP tool: annotate_circle draws a labelled hand-drawn circle"
+    lifecycle: active
+    value_tier: core
+    journey_role: golden
+    usage_frequency: common
+    tags:
+      - mcp
+      - tool
+    source_refs:
+      - kind: file
+        path: Packages/AnnotateMCP/Sources/AnnotateMCPKit/ToolCatalog.swift
+    actor: agent
+    intent: Exercise the circle tool through the real annotate-mcp stdio binary.
+    preconditions:
+      - annotate-mcp release binary built; Annotate.app running or launchable.
+    trigger: An MCP client calls the tool with valid canned arguments.
+    scenarios:
+      - id: annotate.tool.circle.main
+        kind: steps
+        steps:
+          - initialize over stdio, call the tool, assert the ok reply shape.
+    observable_outcomes:
+      - The tool returns ok (draw tools also return an annotationId; screens returns frames).
+    host_applicability:
+      - host_surface: unknown
+        supported: true
+    verification_policy:
+      mode: requirements
+      requirements:
+        - evidence_kind: test_result
+          required_verifiers:
+            - acceptance
+          minimum_count: 1
+    approval_policy:
+      mode: none
+  - id: annotate.tool.highlight
+    title: "MCP tool: annotate_highlight lays a translucent marker rect"
+    lifecycle: active
+    value_tier: core
+    journey_role: golden
+    usage_frequency: common
+    tags:
+      - mcp
+      - tool
+    source_refs:
+      - kind: file
+        path: Packages/AnnotateMCP/Sources/AnnotateMCPKit/ToolCatalog.swift
+    actor: agent
+    intent: Exercise the highlight tool through the real annotate-mcp stdio binary.
+    preconditions:
+      - annotate-mcp release binary built; Annotate.app running or launchable.
+    trigger: An MCP client calls the tool with valid canned arguments.
+    scenarios:
+      - id: annotate.tool.highlight.main
+        kind: steps
+        steps:
+          - initialize over stdio, call the tool, assert the ok reply shape.
+    observable_outcomes:
+      - The tool returns ok (draw tools also return an annotationId; screens returns frames).
+    host_applicability:
+      - host_surface: unknown
+        supported: true
+    verification_policy:
+      mode: requirements
+      requirements:
+        - evidence_kind: test_result
+          required_verifiers:
+            - acceptance
+          minimum_count: 1
+    approval_policy:
+      mode: none
+  - id: annotate.tool.underline
+    title: "MCP tool: annotate_underline draws a pen line under a phrase"
+    lifecycle: active
+    value_tier: core
+    journey_role: golden
+    usage_frequency: common
+    tags:
+      - mcp
+      - tool
+    source_refs:
+      - kind: file
+        path: Packages/AnnotateMCP/Sources/AnnotateMCPKit/ToolCatalog.swift
+      - kind: file
+        path: Packages/AnnotateCore/Sources/AnnotateCore/PenStroke.swift
+    actor: agent
+    intent: Underline a phrase without covering it — the same pen as the loop, so the text underneath stays fully legible where a highlight would tint it.
+    preconditions:
+      - annotate-mcp release binary built; Annotate.app running or launchable.
+    trigger: An MCP client calls the tool with a phrase rectangle.
+    scenarios:
+      - id: annotate.tool.underline.main
+        kind: steps
+        steps:
+          - initialize over stdio, call the tool, assert the ok reply shape.
+    observable_outcomes:
+      - The tool returns ok with an annotationId.
+      - The line sits BELOW the phrase, overhangs both ends unevenly, and is never dead level — it reads as a pen, not a rule.
+    host_applicability:
+      - host_surface: unknown
+        supported: true
+    verification_policy:
+      mode: requirements
+      requirements:
+        - evidence_kind: test_result
+          required_verifiers:
+            - acceptance
+          minimum_count: 1
+    approval_policy:
+      mode: none
+  - id: annotate.tool.locate
+    title: "MCP tool: annotate_locate resolves on-screen elements to real frames"
+    lifecycle: active
+    value_tier: core
+    journey_role: golden
+    usage_frequency: common
+    tags:
+      - mcp
+      - tool
+      - accessibility
+    source_refs:
+      - kind: file
+        path: Annotate/Accessibility/AXLocator.swift
+      - kind: file
+        path: Packages/AnnotateMCP/Sources/AnnotateMCPKit/ToolCatalog.swift
+    actor: agent
+    intent: >-
+      Close the loop between seeing and marking. Every other tool takes coordinates
+      the agent had to work out from a screenshot; this one asks the system where
+      a control actually IS. Without it an agent teaching a real app is guessing
+      pixel positions, and a guess that is 20pt out circles the wrong button.
+    preconditions:
+      - Annotate has been granted Accessibility permission in System Settings.
+      - The target application is running.
+      - The call arrives through the annotate-mcp INSIDE the installed app bundle, and the agent host that started it has been approved (ADR 0017).
+    trigger: An MCP client calls the tool with one or more element queries.
+    scenarios:
+      - id: annotate.tool.locate.main
+        kind: steps
+        steps:
+          - Query a running app for elements by role and by contained text, in one batch.
+          - Feed a returned frame straight into a draw command.
+    observable_outcomes:
+      - Every match carries a full frame {x,y,w,h} in the same global top-left points the draw tools take, so a match can be drawn on with no conversion.
+      - ALL matches are returned, never a single ranked guess — the agent picks, using the ancestry path, owning window and enabled/focused state supplied alongside each.
+      - Multiple queries resolve in ONE tree walk, so locating ten controls costs one traversal rather than ten.
+      - It is app-agnostic — anything exposing the macOS Accessibility API, with no per-app special-casing.
+    host_applicability:
+      - host_surface: unknown
+        supported: true
+    verification_policy:
+      mode: requirements
+      requirements:
+        - evidence_kind: test_result
+          required_verifiers:
+            - acceptance
+          minimum_count: 1
+    approval_policy:
+      mode: none
+  - id: annotate.control.peertrust
+    title: "The control socket answers reads only for Annotate's own bridge, started by an approved host"
+    lifecycle: active
+    value_tier: core
+    journey_role: edge
+    usage_frequency: common
+    tags:
+      - security
+      - protocol
+    source_refs:
+      - kind: file
+        path: Annotate/Control/PeerAuthority.swift
+      - kind: file
+        path: Annotate/Control/UnixSocketListener.swift
+      - kind: file
+        path: docs/adr/0017-the-control-socket-verifies-who-is-calling.md
+    actor: user
+    intent: >-
+      Annotate holds the Accessibility grant; the socket does not. Without this,
+      any process running as the user — a script, an npm postinstall — could read
+      any application's interface through Annotate's grant having been granted
+      nothing itself. Drawing stays ungated, because it adds no authority a local
+      process does not already have.
+    preconditions:
+      - Annotate is running and its socket exists.
+      - annotate-mcp is present inside the app bundle.
+    trigger: Anything connects to the control socket and issues a command.
+    scenarios:
+      - id: annotate.control.peertrust.refuses-a-stranger
+        kind: steps
+        steps:
+          - Send `locate` down the socket from a plain script (Tools/sock-cmd.py).
+          - The reply is ok with coverage `not_authorized`, no results and NO window frames.
+          - Send a draw command from the same script; it draws.
+      - id: annotate.control.peertrust.asks-once-per-host
+        kind: steps
+        steps:
+          - Call `locate` through the bundled bridge from a host Annotate has not seen.
+          - The reply is coverage `approval_pending` within the client's timeout, and ONE panel appears.
+          - Answer it; the next call resolves elements, and no further panel appears for that host.
+    observable_outcomes:
+      - A refused caller learns nothing — not even whether the app it named is running — because the tree is never walked.
+      - The socket is mode 0600 from the instant it is created, not from when the listener goes ready.
+      - Drawing is never gated, in any refusal state, and never consults the signature check at all.
+      - "The answer is remembered per host by CODE SIGNATURE: moving an approved binary keeps the approval, replacing it loses it."
+      - Approvals are visible and revocable from the menu, under Approved Agent Hosts.
+    host_applicability:
+      - host_surface: unknown
+        supported: true
+    verification_policy:
+      mode: requirements
+      requirements:
+        - evidence_kind: test_result
+          required_verifiers:
+            - acceptance
+          minimum_count: 1
+    approval_policy:
+      mode: none
+  - id: annotate.tool.arrow
+    title: "MCP tool: annotate_arrow draws an open-V arrow (auto tail when omitted)"
+    lifecycle: active
+    value_tier: core
+    journey_role: golden
+    usage_frequency: common
+    tags:
+      - mcp
+      - tool
+    source_refs:
+      - kind: file
+        path: Packages/AnnotateMCP/Sources/AnnotateMCPKit/ToolCatalog.swift
+    actor: agent
+    intent: Exercise the arrow tool through the real annotate-mcp stdio binary.
+    preconditions:
+      - annotate-mcp release binary built; Annotate.app running or launchable.
+    trigger: An MCP client calls the tool with valid canned arguments.
+    scenarios:
+      - id: annotate.tool.arrow.main
+        kind: steps
+        steps:
+          - initialize over stdio, call the tool, assert the ok reply shape.
+    observable_outcomes:
+      - The tool returns ok (draw tools also return an annotationId; screens returns frames).
+    host_applicability:
+      - host_surface: unknown
+        supported: true
+    verification_policy:
+      mode: requirements
+      requirements:
+        - evidence_kind: test_result
+          required_verifiers:
+            - acceptance
+          minimum_count: 1
+    approval_policy:
+      mode: none
+  - id: annotate.tool.text
+    title: "MCP tool: annotate_text places a callout plate"
+    lifecycle: active
+    value_tier: core
+    journey_role: golden
+    usage_frequency: common
+    tags:
+      - mcp
+      - tool
+    source_refs:
+      - kind: file
+        path: Packages/AnnotateMCP/Sources/AnnotateMCPKit/ToolCatalog.swift
+    actor: agent
+    intent: Exercise the text tool through the real annotate-mcp stdio binary.
+    preconditions:
+      - annotate-mcp release binary built; Annotate.app running or launchable.
+    trigger: An MCP client calls the tool with valid canned arguments.
+    scenarios:
+      - id: annotate.tool.text.main
+        kind: steps
+        steps:
+          - initialize over stdio, call the tool, assert the ok reply shape.
+    observable_outcomes:
+      - The tool returns ok (draw tools also return an annotationId; screens returns frames).
+    host_applicability:
+      - host_surface: unknown
+        supported: true
+    verification_policy:
+      mode: requirements
+      requirements:
+        - evidence_kind: test_result
+          required_verifiers:
+            - acceptance
+          minimum_count: 1
+    approval_policy:
+      mode: none
+  - id: annotate.tool.clear
+    title: "MCP tool: annotate_clear removes annotations gracefully"
+    lifecycle: active
+    value_tier: core
+    journey_role: golden
+    usage_frequency: common
+    tags:
+      - mcp
+      - tool
+    source_refs:
+      - kind: file
+        path: Packages/AnnotateMCP/Sources/AnnotateMCPKit/ToolCatalog.swift
+    actor: agent
+    intent: Exercise the clear tool through the real annotate-mcp stdio binary.
+    preconditions:
+      - annotate-mcp release binary built; Annotate.app running or launchable.
+    trigger: An MCP client calls the tool with valid canned arguments.
+    scenarios:
+      - id: annotate.tool.clear.main
+        kind: steps
+        steps:
+          - initialize over stdio, call the tool, assert the ok reply shape.
+    observable_outcomes:
+      - The tool returns ok (draw tools also return an annotationId; screens returns frames).
+    host_applicability:
+      - host_surface: unknown
+        supported: true
+    verification_policy:
+      mode: requirements
+      requirements:
+        - evidence_kind: test_result
+          required_verifiers:
+            - acceptance
+          minimum_count: 1
+    approval_policy:
+      mode: none
+  - id: annotate.tool.screens
+    title: "MCP tool: annotate_screens reports display frames for aiming"
+    lifecycle: active
+    value_tier: core
+    journey_role: alternate
+    usage_frequency: common
+    tags:
+      - mcp
+      - tool
+    source_refs:
+      - kind: file
+        path: Packages/AnnotateMCP/Sources/AnnotateMCPKit/ToolCatalog.swift
+    actor: agent
+    intent: Exercise the screens tool through the real annotate-mcp stdio binary.
+    preconditions:
+      - annotate-mcp release binary built; Annotate.app running or launchable.
+    trigger: An MCP client calls the tool with valid canned arguments.
+    scenarios:
+      - id: annotate.tool.screens.main
+        kind: steps
+        steps:
+          - initialize over stdio, call the tool, assert the ok reply shape.
+    observable_outcomes:
+      - The tool returns ok (draw tools also return an annotationId; screens returns frames).
+    host_applicability:
+      - host_surface: unknown
+        supported: true
+    verification_policy:
+      mode: requirements
+      requirements:
+        - evidence_kind: test_result
+          required_verifiers:
+            - acceptance
+          minimum_count: 1
+    approval_policy:
+      mode: none
+  - id: annotate.ink.pen
+    title: One pen draws the loop, the arrow and the line
+    lifecycle: active
+    value_tier: core
+    journey_role: golden
+    usage_frequency: common
+    tags:
+      - ink
+      - rendering
+    source_refs:
+      - kind: file
+        path: Packages/AnnotateCore/Sources/AnnotateCore/PenStroke.swift
+    actor: agent
+    intent: Every stroked mark is drawn by one shared hand-drawn pen, so the loop, the arrow and the underline share a single visual identity.
+    preconditions:
+      - Annotate.app running; socket available.
+    trigger: A circle, arrow and underline are drawn side by side.
+    scenarios:
+      - id: annotate.ink.pen.main
+        kind: steps
+        steps:
+          - Draw a circle, an arrow and an underline in one screen region.
+          - Compare the three marks' line quality.
+    observable_outcomes:
+      - "All three marks show the same pen character: tapered ends, width variance along the stroke, and translucent ink."
+      - No mark looks like a geometric primitive or a different tool from the others.
+    host_applicability:
+      - host_surface: unknown
+        supported: true
+    verification_policy:
+      mode: requirements
+      requirements:
+        - evidence_kind: test_result
+          required_verifiers:
+            - acceptance
+          minimum_count: 1
+    approval_policy:
+      mode: none
+  - id: annotate.ink.wipe
+    title: Clear-all wipes the board like a chalkboard eraser
+    lifecycle: active
+    value_tier: core
+    journey_role: golden
+    usage_frequency: common
+    tags:
+      - ink
+      - clear
+      - motion
+    source_refs:
+      - kind: file
+        path: Packages/AnnotateCore/Sources/AnnotateCore/WipePlanner.swift
+      - kind: file
+        path: Packages/AnnotateCore/Sources/AnnotateCore/WipeMask.swift
+    actor: agent
+    intent: Clearing every annotation reads as a deliberate eraser sweep across the real ink, not an abrupt disappearance.
+    preconditions:
+      - Several sticky annotations are live and spread across the screen.
+    trigger: A clear command with no annotationId arrives.
+    scenarios:
+      - id: annotate.ink.wipe.main
+        kind: steps
+        steps:
+          - Draw several sticky marks spread across the display.
+          - Send clear with no annotationId.
+          - Watch the sweep.
+    observable_outcomes:
+      - The eraser band travels across the marks that are actually on screen rather than over empty space.
+      - Ink under the band is erased progressively and the fade overlaps the sweep, so the board ends empty in one continuous motion.
+    host_applicability:
+      - host_surface: unknown
+        supported: true
+    verification_policy:
+      mode: requirements
+      requirements:
+        - evidence_kind: test_result
+          required_verifiers:
+            - acceptance
+          minimum_count: 1
+    approval_policy:
+      mode: none
+  - id: annotate.ink.style
+    title: Stroke weight and colour roles change the mark's emphasis
+    lifecycle: active
+    value_tier: core
+    journey_role: alternate
+    usage_frequency: common
+    tags:
+      - ink
+      - protocol
+      - styling
+    source_refs:
+      - kind: file
+        path: Packages/AnnotateCore/Sources/AnnotateCore/Tokens.swift
+    actor: agent
+    intent: Pick emphasis by intent — thin/regular/bold and accent/warn/ok/ink or an exact hex — instead of by pixel width and RGB.
+    preconditions:
+      - Annotate.app running; socket available.
+    trigger: Marks are drawn with differing weight and color values.
+    scenarios:
+      - id: annotate.ink.style.main
+        kind: steps
+        steps:
+          - Draw the same shape three times at thin, regular and bold weight.
+          - "Draw marks in accent, warn, ok and an explicit #RRGGBB."
+    observable_outcomes:
+      - thin < regular < bold is clearly visible, and weight still scales with the size of the target rather than overriding it.
+      - "Each colour role renders its own distinct hue and an explicit #RRGGBB is honoured exactly."
+      - Omitting weight or color yields the historical regular/accent appearance.
+    host_applicability:
+      - host_surface: unknown
+        supported: true
+    verification_policy:
+      mode: requirements
+      requirements:
+        - evidence_kind: test_result
+          required_verifiers:
+            - acceptance
+          minimum_count: 1
+    approval_policy:
+      mode: none
+
+  - id: annotate.ink.labels
+    title: A label never covers an annotation, and steps aside when one lands under it
+    lifecycle: active
+    value_tier: core
+    journey_role: golden
+    usage_frequency: common
+    tags:
+      - ink
+      - labels
+      - teaching
+    source_refs:
+      - kind: file
+        path: Packages/AnnotateCore/Sources/AnnotateCore/CalloutPlacement.swift
+      - kind: file
+        path: Annotate/Overlay/OverlayEngine.swift
+    actor: agent
+    intent: Teach a crowded application by drawing several labelled marks one at a time, and have every label stay readable without positioning any of them by hand.
+    preconditions:
+      - Annotate.app running; socket available.
+      - A target application on screen with several controls close together.
+    trigger: Marks with labels are drawn one at a time over the same region.
+    scenarios:
+      - id: annotate.ink.labels.main
+        kind: steps
+        steps:
+          - Draw four labelled loops down a tightly stacked tool column, one at a time.
+          - Add a labelled arrow, a highlight and an underline over the same area.
+          - Pass the target window as `within` on each command.
+      - id: annotate.ink.labels.crowded
+        kind: steps
+        steps:
+          - Keep drawing labelled marks until every position beside the marks is taken.
+    observable_outcomes:
+      - No label overlaps another label, any mark's ink, its own target, or its own arrow shaft.
+      - Marks themselves may overlap freely — they still land exactly on their targets.
+      - Every label stays inside the window given as `within`.
+      - A label pushed clear of its mark is joined to it by a faint line, trimmed at both ends; an arrow's label never grows one.
+      - A label displaced by a later mark ANIMATES to its new position rather than jumping.
+      - When every slot beside a mark is taken, the label still finds free space rather than covering something.
+    host_applicability:
+      - host_surface: unknown
+        supported: true
+    verification_policy:
+      mode: requirements
+      requirements:
+        - evidence_kind: test_result
+          required_verifiers:
+            - acceptance
+          minimum_count: 1
+    approval_policy:
+      mode: none
+
+  - id: annotate.ink.yield
+    title: Marks under the pointer get out of the way — all of them, by their real shape
+    lifecycle: active
+    value_tier: core
+    journey_role: alternate
+    usage_frequency: common
+    tags:
+      - ink
+      - interaction
+    source_refs:
+      - kind: file
+        path: Annotate/Overlay/AnnotationInteraction.swift
+    actor: user
+    intent: Look at, and click, the thing an annotation is drawn on without clearing the annotation first.
+    preconditions:
+      - Annotate.app running with several overlapping marks on screen.
+    trigger: The pointer moves over the annotations, and a button is held.
+    scenarios:
+      - id: annotate.ink.yield.main
+        kind: steps
+        steps:
+          - Move the pointer onto ink shared by two overlapping marks.
+          - Move the pointer into the empty middle of a loop.
+          - Move the pointer to where a label used to be before a later mark displaced it.
+    observable_outcomes:
+      - Every mark under the pointer dims together, not only the topmost.
+      - The empty middle of a loop is not the loop — marks stay at full strength there.
+      - Approaching a stroke within a few points counts as hovering it.
+      - A label plate is solid, so anywhere inside it counts.
+      - Nothing dims at a position a mark has moved away from.
+      - Holding the button hides the marks under the pointer; releasing restores them; clicks reach the app underneath.
+    host_applicability:
+      - host_surface: unknown
+        supported: true
+    verification_policy:
+      mode: requirements
+      requirements:
+        - evidence_kind: test_result
+          required_verifiers:
+            - acceptance
+          minimum_count: 1
+    approval_policy:
+      mode: none
