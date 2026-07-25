@@ -1,0 +1,21 @@
+{
+  "name": "annotate-reel",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "remotion studio",
+    "build": "remotion render Tools out/tools.mp4 --codec=h264 --crf=16",
+    "gif": "remotion render Tools out/tools.gif --codec=gif --every-nth-frame=2 --scale=0.55"
+  },
+  "dependencies": {
+    "@remotion/cli": "^4.0.499",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "remotion": "^4.0.499"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,4 @@
+# Every file, one owner. With branch protection on, this makes review by
+# @adammcarter mandatory before anything can merge — the repo is open to
+# forks and pull requests from anyone, and closed to anyone merging them.
+* @adammcarter

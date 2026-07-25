@@ -1,0 +1,27 @@
+schema_version: 1
+workspace_id: annotate
+component_id: annotate
+data_root: .
+use_cases_dir: use-cases
+evidence_dir: .use-cases/evidence
+demo_capsules_dir: .use-cases/demo-capsules
+showcase_runs_dir: .use-cases/showcase-runs
+default_workflow_mode: continuous
+
+# Acceptance verification.
+#
+# Every behaviour in use-cases/annotate.yml names a verifier; each one resolves
+# to a real command that exercises the shipped product, not a unit test. The
+# distinction matters here: the unit suites pin geometry to exact coordinates
+# and prove the drawing is deterministic, but they cannot tell you the overlay
+# actually appeared on a screen, that clicks passed through it, or that an agent
+# driving MCP over stdio landed a mark. Those need the running app.
+#
+# Run them with `uc verify --all`, or one at a time straight from the shell:
+#   bash Tools/uc-verify.sh annotate.tool.circle
+verifiers:
+  default: acceptance
+  acceptance:
+    kind: script
+    evidence_kind: test_result
+    command: ["bash", "Tools/uc-verify.sh", "{slug}"]

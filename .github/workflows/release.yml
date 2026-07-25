@@ -1,0 +1,319 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g. v0.1.0)'
+        required: true
+
+jobs:
+  build:
+    name: Build and publish
+    # macOS 26. Not a preference — the app icon is an Icon Composer .icon
+    # bundle, which only the Xcode 26 toolchain can compile, and Xcode 16's
+    # Swift front end times out type-checking the Bezier sampler in WipePlanner.
+    # An older image builds an app with no icon, or does not build at all.
+    runs-on: macos-26
+    # The default job limit is six hours. Signing blocks on a keychain ACL
+    # prompt and notarisation blocks on Apple's service; either stalling should
+    # cost a legible failure in minutes, not a wasted afternoon.
+    timeout-minutes: 45
+    permissions:
+      contents: write
+
+    env:
+      APP: build/Build/Products/Release/Annotate.app
+
+    steps:
+      # Pinned by commit, not tag. These steps share a job with an unlocked
+      # keychain holding the Developer ID key, so a moved tag upstream would be
+      # a path to signing software in our name.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+        with:
+          # The job does not push, and leaving the token in .git/config would
+          # hand it to every step that follows.
+          persist-credentials: false
+
+      # The tag is the version, and AnnotateVersion.current is what the app and
+      # the MCP handshake actually report. If they disagree the release is wrong
+      # in a way nobody notices until an agent prints the old number, so it
+      # fails here instead of shipping.
+      #
+      # Anything below 1.0 publishes as a PRE-RELEASE: the wire protocol and the
+      # tool schemas are still free to change, and GitHub's own badge says that
+      # more reliably than a sentence in the notes.
+      - name: Resolve and check the version
+        id: version
+        env:
+          # Passed through the environment rather than interpolated into the
+          # script. A tag name is attacker-controllable text and reaches bash
+          # here BEFORE the version check can reject it — in the one job that
+          # holds the signing secrets, and via a trigger that branch protection
+          # does not review.
+          RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          TAG="$RAW_TAG"
+          VERSION="${TAG#v}"
+          SOURCE=$(sed -n 's/.*static let current = "\(.*\)".*/\1/p' \
+            Packages/AnnotateCore/Sources/AnnotateCore/Version.swift)
+
+          if [ "$VERSION" != "$SOURCE" ]; then
+            echo "::error::Tag $TAG wants $VERSION, but AnnotateVersion.current is $SOURCE."
+            echo "::error::Update Version.swift and MARKETING_VERSION, or retag."
+            exit 1
+          fi
+
+          case "$VERSION" in
+            0.*) PRERELEASE=true ;;
+            *)   PRERELEASE=false ;;
+          esac
+
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "prerelease=$PRERELEASE"
+          } >> "$GITHUB_OUTPUT"
+          echo "Releasing $TAG (prerelease=$PRERELEASE)"
+
+      # Fail loudly rather than quietly shipping an unsigned build.
+      #
+      # An unsigned Annotate is not merely inconvenient: macOS ties the
+      # Accessibility grant to the code signature, so every unsigned update
+      # looks like a different application and the user has to grant permission
+      # again. A release that lost its signature because a secret expired would
+      # be a regression nobody would spot until the complaints arrived.
+      - name: Check the signing material is present
+        env:
+          CERT: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          AC_KEY: ${{ secrets.AC_API_KEY_P8_BASE64 }}
+          AC_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+          AC_ISSUER: ${{ secrets.AC_API_ISSUER_ID }}
+        run: |
+          missing=""
+          for name in CERT CERT_PASSWORD AC_KEY AC_KEY_ID AC_ISSUER; do
+            [ -n "${!name}" ] || missing="$missing $name"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing signing secrets:$missing"
+            echo "::error::docs/RELEASING.md says what each one is and how to make it."
+            exit 1
+          fi
+
+      # A throwaway keychain with a random password, unlocked only for this job
+      # and deleted afterwards even if the job fails. The certificate never
+      # touches the default login keychain and is never on disk unencrypted for
+      # longer than the import takes.
+      - name: Import the Developer ID certificate
+        env:
+          CERT: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          # Step-local. Exporting it to $GITHUB_ENV would hand every later
+          # step the ability to unlock the keychain and export the private key
+          # — including any third-party action in this job.
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          # No auto-lock. A keychain that relocks mid-build makes codesign
+          # prompt, and a prompt on a runner is a hang rather than an error.
+          security set-keychain-settings -lut 21600 build.keychain
+
+          printf '%s' "$CERT" | base64 --decode > /tmp/cert.p12
+          security import /tmp/cert.p12 -k build.keychain -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          rm -f /tmp/cert.p12
+
+          # Lets codesign use the private key without an interactive prompt.
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "$KEYCHAIN_PASSWORD" build.keychain > /dev/null
+
+          # Counted, not printed. The identity is selected by TYPE below, so the
+          # certificate holder's name and team never appear in this repository
+          # or in a build log.
+          found=$(security find-identity -v -p codesigning build.keychain \
+            | grep -c "Developer ID Application" || true)
+          echo "Developer ID Application identities available: $found"
+          [ "$found" -ge 1 ]
+
+      # Built unsigned, then signed by hand below.
+      #
+      # Signing inside-out is the only order that works: the outer bundle's seal
+      # covers the nested binary, so signing the app first and the helper second
+      # invalidates the app. Doing it explicitly also keeps DEVELOPMENT_TEAM out
+      # of the project file, where it would otherwise have to live for Xcode to
+      # sign anything — a team id in a public repo is a small leak, but it is a
+      # free one to avoid.
+      - name: Build the app
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          xcodebuild build \
+            -project Annotate.xcodeproj \
+            -scheme Annotate \
+            -configuration Release \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            MARKETING_VERSION="$VERSION"
+
+      - name: Build the MCP server
+        run: swift build -c release --package-path Packages/AnnotateMCP
+
+      # The MCP server ships INSIDE the app bundle rather than beside it.
+      #
+      # It is useless on its own — it relays to a socket the app owns — so a
+      # loose binary is a second thing to install, a second thing to put
+      # somewhere, and a second thing that can fall out of step with the app it
+      # talks to. Inside the bundle it cannot drift: one download, one move to
+      # /Applications, and the agent's command is a fixed path that every
+      # install shares and that survives an update.
+      #
+      # In Contents/MacOS, not Contents/Resources. Both verify, but only a
+      # helper in MacOS is sealed as NESTED CODE; in Resources it is sealed as
+      # an ordinary resource, which is the placement Apple discourages for
+      # executables and the one notarisation is most likely to argue with.
+      - name: Bundle the MCP server inside the app
+        run: |
+          cp Packages/AnnotateMCP/.build/release/annotate-mcp "$APP/Contents/MacOS/annotate-mcp"
+          chmod +x "$APP/Contents/MacOS/annotate-mcp"
+
+      # Hardened runtime is required for notarisation, and the secure timestamp
+      # is what keeps the signature valid after the certificate itself expires.
+      # `--identifier` on the helper is load-bearing, not tidiness. ADR 0017's
+      # requirement names `com.adammcarter.Annotate.mcp`, and codesign without
+      # this flag derives an identifier from the binary's LC_UUID — a value that
+      # changes on every link. The requirement would then match the build it was
+      # written against and nothing else, so `locate` would be refused for the
+      # entire life of the release. `Tools/uc-verify.sh` and a drift test in
+      # AnnotateCoreTests both assert this literal is still here.
+      - name: Sign
+        run: |
+          # A deadline on each call: codesign has none of its own, and the two
+          # things it waits on — a keychain ACL prompt and Apple's timestamp
+          # service — both hang rather than fail. A prompt cannot be answered on
+          # a runner, so waiting is never the right behaviour.
+          #
+          # `perl -e alarm`, not `timeout(1)`. GNU coreutils is not on a macOS
+          # runner, and an earlier version of this step used `timeout` and failed
+          # the release with `command not found` — a guard that broke the thing
+          # it was guarding. It passed locally because Homebrew had put coreutils
+          # on the PATH. Perl ships with macOS.
+          #
+          # Measured locally for reference: a timestamped signature of this
+          # helper takes 0.16s and of the whole bundle 0.18s, five runs each.
+          deadline() { perl -e 'alarm shift; exec @ARGV' "$@"; }
+
+          deadline 300 codesign --force --options runtime --timestamp \
+            --identifier com.adammcarter.Annotate.mcp \
+            --sign "Developer ID Application" "$APP/Contents/MacOS/annotate-mcp"
+          deadline 300 codesign --force --options runtime --timestamp \
+            --sign "Developer ID Application" "$APP"
+
+          codesign --verify --strict --deep --verbose=2 "$APP"
+
+      - name: Notarise and staple
+        env:
+          AC_KEY: ${{ secrets.AC_API_KEY_P8_BASE64 }}
+          AC_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+          AC_ISSUER: ${{ secrets.AC_API_ISSUER_ID }}
+        run: |
+          printf '%s' "$AC_KEY" | base64 --decode > /tmp/ac.p8
+
+          ditto -c -k --keepParent "$APP" /tmp/notarise.zip
+          xcrun notarytool submit /tmp/notarise.zip \
+            --key /tmp/ac.p8 --key-id "$AC_KEY_ID" --issuer "$AC_ISSUER" \
+            --wait --timeout 30m
+          rm -f /tmp/ac.p8 /tmp/notarise.zip
+
+          # Stapling puts the notarisation ticket inside the bundle, so a first
+          # launch works on a machine that is offline, or behind a firewall that
+          # blocks Apple's ticket lookup.
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+
+          # The real gate: what Gatekeeper will decide on a user's machine.
+          spctl --assess --type execute --verbose=2 "$APP"
+
+      # As soon as nothing else needs to sign. The publish step below runs a
+      # third-party action, and it should not share a job with a keychain that
+      # still holds a Developer ID private key.
+      - name: Remove the keychain
+        run: security delete-keychain build.keychain
+
+      - name: Package
+        run: |
+          ditto -c -k --keepParent "$APP" "Annotate-${{ steps.version.outputs.tag }}.zip"
+
+      - name: Checksum
+        run: shasum -a 256 "Annotate-${{ steps.version.outputs.tag }}.zip" | tee checksum.txt
+
+      # The notes are ASSEMBLED, not written: what changed since the last tag,
+      # then the README's own opening — the pitch, the reel, and the three
+      # numbered install steps.
+      #
+      # Copying that opening into this file instead would mean two versions of
+      # the pitch, and the one nobody edits is the one every release publishes.
+      - name: Compose the notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          # Everything above the "# Why" heading. If that heading is ever
+          # renamed this quietly takes the WHOLE README, so a test in
+          # AnnotateCoreTests holds the two files to the same marker.
+          sed '/^# Why$/,$d' README.md > readme-head.md
+
+          # Three rewrites, because a release body is not rendered inside the
+          # repository tree and every repository-relative link in it resolves to
+          # something else or to nothing.
+          #
+          # The reel is pinned to the TAG rather than to a branch, so an old
+          # release keeps showing the ink it shipped with.
+          # The README's arrow points ACROSS to a page; in the notes the same
+          # words download a file, and an arrow there suggests navigation. The
+          # README keeps it — it is right where it is.
+          sed -i '' \
+            -e "s|Download the latest release →|Download the latest release|" \
+            -e "s|docs/media/tools.gif|https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${TAG}/docs/media/tools.gif|" \
+            -e "s|(\.\./\.\./releases/latest)|(https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/Annotate-${TAG}.zip)|" \
+            -e "s|https://github.com/adammcarter/annotate|https://github.com/${GITHUB_REPOSITORY}|g" \
+            readme-head.md
+
+          # Generated by the API rather than by the publish action, which can
+          # only APPEND its own list — and the changelog belongs above the pitch,
+          # not below it. Reading this release needs the diff first; the pitch is
+          # for whoever arrived from a link.
+          gh api "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+            -f tag_name="$TAG" -q .body > notes.md
+          printf '\n\n' >> notes.md
+          cat readme-head.md >> notes.md
+          cat notes.md
+
+      - name: Publish release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.4.0
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          prerelease: ${{ steps.version.outputs.prerelease }}
+          files: |
+            Annotate-${{ steps.version.outputs.tag }}.zip
+            checksum.txt
+          # Off: the step above already put the generated list in the body, at
+          # the top. Leaving this on would append a second copy below the pitch.
+          generate_release_notes: false
+          body_path: notes.md
+
+      # Runs even when something above failed — including before the deletion
+      # above was reached — so a broken build never leaves a keychain holding a
+      # Developer ID certificate on the runner.
+      - name: Clean up after a failure
+        if: always()
+        run: |
+          security delete-keychain build.keychain 2>/dev/null || true
+          rm -f /tmp/cert.p12 /tmp/ac.p8 /tmp/notarise.zip || true

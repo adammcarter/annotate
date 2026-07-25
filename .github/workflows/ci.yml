@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Nothing here writes. GitHub forces read-only for pull requests from forks
+# anyway, but stating it means a later step cannot quietly inherit more.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build and test
+    # macOS 26, matching the release runner. Building the app here on an
+    # older toolchain than the one that ships it would let a release-only
+    # compile failure through a green CI.
+    runs-on: macos-26
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+
+      - name: Show toolchain
+        run: swift --version && xcodebuild -version
+
+      # The two packages are pure Swift and hold the great majority of the
+      # tests, including the exact-coordinate goldens that pin the drawing
+      # geometry. They run without an app, a display, or a signing identity.
+      - name: Test AnnotateCore
+        run: swift test --package-path Packages/AnnotateCore
+
+      # TEST, not just build. These were only compiled, so a change that broke
+      # the MCP wire translation merged green under a check called "Build and
+      # test" — which is worse than having no check at all.
+      - name: Test the MCP server
+        run: swift test --package-path Packages/AnnotateMCP
+
+      # The app target's tests need AppKit and a built app bundle. They do not
+      # need signing: CODE_SIGNING_ALLOWED=NO keeps this working on a runner
+      # with no certificates, which is also why DEVELOPMENT_TEAM is empty in
+      # the project.
+      - name: Test the app
+        run: |
+          # Without this the step's exit status is xcbeautify's, so a failing
+          # build can leave the required check green.
+          set -o pipefail
+          xcodebuild test \
+            -project Annotate.xcodeproj \
+            -scheme Annotate \
+            -destination 'platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO \
+          | xcbeautify || exit ${PIPESTATUS[0]}
+
+      # ACCEPTANCE INTEGRITY, not acceptance itself.
+      #
+      # Six of the twenty-one behaviours are provable from tests alone; the rest
+      # need a running app, and two of those need Accessibility permission,
+      # which cannot be granted to a runner without a human at the machine. So
+      # CI does not pretend to run them. What it CAN do is refuse the two ways
+      # this ledger rots:
+      #
+      #   1. A behaviour claimed with nothing bound to it — which is exactly the
+      #      state this repo was in until the ledger was committed: twenty-one
+      #      rows, zero proofs, and no way to tell from the outside.
+      #   2. A proof that no longer covers the code it was taken against. The
+      #      ledger stores a hash of each bound span, so changing the drawing
+      #      code without re-running acceptance locally shows up as STALE here
+      #      rather than shipping quietly.
+      #
+      # Installing the tool is deliberate: this check is worthless if it is
+      # skipped whenever the tool is missing.
+      - name: Acceptance ledger
+        run: |
+          npm install -g @adammcarter/use-cases@0.5.5
+          uc matrix validate --json > /dev/null
+          uc scan --json | tee /tmp/uc-scan.json | python3 -c '
+          import json, sys
+          status = json.load(sys.stdin)["data"]["status"]
+          summary = status["summary"]
+          print("acceptance:", status["acceptance_claim"]["statement"])
+          print("summary:", summary)
+          bad = {k: v for k, v in summary.items()
+                 if k in ("unbound", "invalid", "stale_local", "unverified_local") and v}
+          if status.get("integrity_errors"):
+              for e in status["integrity_errors"][:5]:
+                  print("integrity:", e["code"], e.get("row_id"), e.get("message", "")[:120])
+              sys.exit(1)
+          if bad:
+              print("REJECTED — rows needing attention:", bad)
+              print("Run `uc verify --all` locally and commit .use-cases/.")
+              sys.exit(1)
+          '
+
+      # The six behaviours that need nothing but the test suites. The rest need
+      # a running app and a human-granted permission, and are verified locally —
+      # the step above is what stops that becoming a licence to skip them.
+      - name: Verify the behaviours that need no app
+        run: |
+          for row in annotate.core.determinism annotate.ink.pen annotate.ink.wipe \
+                     annotate.ink.style annotate.ink.labels annotate.ink.yield; do
+            uc verify --row "$row" --json > /dev/null || { echo "::error::$row failed"; exit 1; }
+          done
+          echo "six test-backed behaviours verified on this runner"
+
+      # Warnings are how this project noticed a real actor-isolation bug, so
+      # they are worth seeing in the log even while they are not yet fatal.
+      - name: Report warnings
+        if: always()
+        run: |
+          xcodebuild build \
+            -project Annotate.xcodeproj \
+            -scheme Annotate \
+            -destination 'platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO 2>&1 \
+          | grep "warning:" | sort -u || echo "no warnings"
